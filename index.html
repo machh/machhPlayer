@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MAPlayer - WebSocket+fMP4 低延迟播放器</title>
+    <style>
+        body { margin:0; background:#000; display:flex; flex-direction:column; height:100vh; font-family:Arial; }
+        #video { width:100%; height:auto; flex:1; background:#000; }
+        .control { padding:15px; background:rgba(0,0,0,0.7); color:white; text-align:center; }
+        input { width:60%; padding:10px; font-size:16px; }
+        button { padding:10px 20px; margin:0 10px; font-size:16px; }
+    </style>
+</head>
+<body>
+
+<video id="video" autoplay playsinline ></video>
+
+<div class="control">
+    <input id="url" type="text" placeholder="ws://your-server/live/stream" 
+           value="ws://192.168.0.29:8888/live/test">
+    <button onclick="player.play(url.value)">播放</button>
+    <button onclick="player.stop()">停止</button>
+</div>
+
+<script src="maPlayer.js"></script>
+<script>
+    const player = new MAPlayer('#video', {
+        targetLatency: 0.4,
+        maxLatency: 0.8,
+        catchUpRate: 1.15,
+        codec: 'h264' 
+    });
+
+    // 可选：回车播放 muted
+    document.getElementById('url').addEventListener('keypress', e => {
+        if (e.key === 'Enter') player.play(e.target.value);
+    });
+</script>
+
+</body>
+</html>
