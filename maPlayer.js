@@ -1,4 +1,4 @@
-// maPlayer.js (2025 终极修复版 - 遵循 MSE 最佳实践)
+
 class MAPlayer {
     constructor(videoElement, options = {}) {
         this.video = typeof videoElement === 'string' ? document.querySelector(videoElement) : videoElement;
@@ -28,7 +28,7 @@ class MAPlayer {
             watchdogTimer: null,
             lastAppendTime: 0,
             stuckRestartCount: 0,
-            hasInitSegment: false,   // 【关键】是否已追加 moov
+            hasInitSegment: false,   // 是否已追加 moov
             currentRetryDelay: this.config.retryDelay, // 当前重连延迟
             isAppending: false       // SourceBuffer 正在更新的内部标记
         };
@@ -39,12 +39,12 @@ class MAPlayer {
         this.video.addEventListener('error', (e) => {
             const err = this.video.error;
             console.error('[MAPlayer] Video Element Error:', err ? `${err.code}: ${err.message}` : 'Unknown');
-            this.stop(true); // 发生致命错误，强制清理并重试
+            this.stop(true); // 发生错误，强制清理并重试
         });
     }
 
     _getSupportedCodec() {
-        // 【已修复】H.264 包含 AAC 标识 mp4a.40.2
+        // H.264 包含 AAC 标识 mp4a.40.2
         const codecs = {
             'h265': [
                 'video/mp4; codecs="hev1.1.6.L120.B0"', 'video/mp4; codecs="hvc1.1.6.L120.B0"', 
@@ -74,7 +74,7 @@ class MAPlayer {
 
     async _createMediaSource() {
         return new Promise((resolve, reject) => {
-            // 【已修复】清理旧的 Object URL
+            // 清理旧的 Object URL
             if (this.state.objectUrl) URL.revokeObjectURL(this.state.objectUrl);
             
             const ms = new MediaSource();
@@ -100,7 +100,7 @@ class MAPlayer {
     _startCleanupInterval() {
         if (this.state.cleanupTimer) clearInterval(this.state.cleanupTimer);
         
-        // 【已修复】定期删除已播放 buffer，释放内存 (SourceBuffer.remove)
+        // 定期删除已播放 buffer，释放内存 (SourceBuffer.remove)
         this.state.cleanupTimer = setInterval(() => {
             const sb = this.state.sourceBuffer;
             if (!sb || sb.updating || !this.state.isPlaying || sb.buffered.length === 0) return;
@@ -108,21 +108,21 @@ class MAPlayer {
             const current = this.video.currentTime;
             const start = sb.buffered.start(0);
 
-            // 保留当前播放时间前 1 秒的 buffer
+            // 保留当前播放时间前1秒的 buffer
             const removeTime = current - 1.0; 
             
             if (removeTime > start) {
                 try {
-                    console.log(`[Cleanup] 删除旧 buffer: [${start.toFixed(2)}s] -> [${removeTime.toFixed(2)}s]`);
+                    console.log(`[Cleanup] 删除旧buffer: [${start.toFixed(2)}s] -> [${removeTime.toFixed(2)}s]`);
                     sb.remove(start, removeTime);
                 } catch (err) {
-                    console.warn('[Cleanup] 删除 buffer 失败:', err);
+                    console.warn('[Cleanup] 删除buffer 失败:', err);
                 }
             }
         }, this.config.cleanupIntervalMs);
     }
     
-    // 【新增】统一追加逻辑，处理重试
+    // 统一追加逻辑，处理重试
     _appendBuffer(chunk) {
         if (!this.state.sourceBuffer || this.state.sourceBuffer.updating) return false;
         
@@ -138,7 +138,7 @@ class MAPlayer {
                 // 发生配额错误时，不放回队列，而是等待 cleanup 释放内存。
             } else {
                 console.error('[MAPlayer] appendBuffer 异常:', err);
-                // 严重错误，清空队列并尝试重连
+                // 清空队列并尝试重连
                 this.stop(true);
             }
             return false;
@@ -153,7 +153,7 @@ class MAPlayer {
             return;
         }
         
-        // 1. 【关键修复】处理 Init Segment (moov)
+        // 处理 Init Segment (moov)
         if (!this.state.hasInitSegment) {
             // 我们信任服务端总是将 moov 作为第一个包发送
             const initSegment = this.state.queue.shift();
@@ -202,7 +202,7 @@ class MAPlayer {
         }, 500);
     }
     
-    // 【新增】WebSocket 错误/关闭时的重连逻辑
+    // WebSocket 错误/关闭时的重连逻辑
     _handleWsClose(wasClean) {
         if (!this.state.isPlaying) return;
 
@@ -216,7 +216,7 @@ class MAPlayer {
 
         this.state.stuckRestartCount++;
         
-        // 【已修复】指数退避 (Exponential Backoff)
+        // 指数退避 (Exponential Backoff)
         const delay = Math.min(this.state.currentRetryDelay, 10000); // 最大延迟 10秒
         this.state.currentRetryDelay = delay * 1.5;
 
@@ -249,11 +249,11 @@ class MAPlayer {
             this.state.sourceBuffer = sb;
             this.state.hasInitSegment = false; // 重置 Init 状态
 
-            // 【关键修复】updateend 驱动队列消费
+            // updateend 驱动队列消费
             sb.addEventListener('updateend', () => {
                 this.state.isAppending = false;
                 
-                // 【已修复】首次追帧逻辑：在 Init Segment 加载完成后尝试跳转
+                // 首次追帧逻辑：在 Init Segment 加载完成后尝试跳转
                 if (this.state.hasInitSegment && sb.buffered.length > 0 && this.video.currentTime < sb.buffered.start(0) + 0.1) {
                     const seekTime = sb.buffered.start(0);
                     console.log(`[MAPlayer] [Ready] Init Segment Loaded, 首次跳转至: ${seekTime.toFixed(2)}s`);
@@ -284,7 +284,7 @@ class MAPlayer {
 
             ws.onopen = () => console.log('[MAPlayer] WS Connected');
             
-            // 【已修复】使用单独的关闭/错误处理函数
+            // 使用单独的关闭/错误处理函数
             ws.onclose = (e) => this._handleWsClose(e.code === 1000);
             ws.onerror = (e) => {
                 console.error('[MAPlayer] WS Error', e);
@@ -350,7 +350,7 @@ class MAPlayer {
         } catch(e) {}
         this.state.mediaSource = null;
         
-        // 5. 【已修复】清理 video 标签
+        // 5.清理 video 标签
         try {
             if (this.state.objectUrl) {
                 URL.revokeObjectURL(this.state.objectUrl);
@@ -381,5 +381,6 @@ class MAPlayer {
         }
     }
 }
+
 
 window.MAPlayer = MAPlayer;
