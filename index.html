@@ -3,40 +3,155 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MAPlayer - WebSocket+fMP4 低延迟播放器</title>
+    <title>WebSocket+Fmp4流播放器</title>
     <style>
-        body { margin:0; background:#000; display:flex; flex-direction:column; height:100vh; font-family:Arial; }
-        #video { width:100%; height:auto; flex:1; background:#000; }
-        .control { padding:15px; background:rgba(0,0,0,0.7); color:white; text-align:center; }
-        input { width:60%; padding:10px; font-size:16px; }
-        button { padding:10px 20px; margin:0 10px; font-size:16px; }
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: Arial, sans-serif;
+        }
+        /* 标题栏样式 */
+        .header {
+            background-color: #4a6fa5;
+            color: white;
+            padding: 12px;
+            text-align: center;
+        }
+        .header small {
+            font-size: 12px;
+            opacity: 0.8;
+            display: block;
+            margin-top: 4px;
+        }
+        /* 控制区域样式 */
+        .control-bar {
+            padding: 10px;
+            background-color: #f5f5f5;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        .control-bar input {
+            flex: 1;
+            min-width: 200px;
+            height: 52px;
+            padding: 6px 8px;
+            border: 1px solid #3cbb91;
+            border-radius: 4px;
+        }
+        .control-bar button {
+            height: 4opx;
+            padding: 6px 12px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            color: white;
+        }
+        .play-btn {            
+            background-color: #28a745;
+        }
+        .stop-btn {
+            background-color: #dc3545;
+        }
+        .qrcode {
+            width: 52px;
+            height: 52px;
+            background-color: #eee;
+            border: 1px solid #ddd;
+        }
+        /* 视频区域样式 */
+        .video-container {
+            background-color: black;
+            width: 100%;
+            height: calc(100vh - 120px); /* 自适应高度 */
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .video-container video {
+            max-width: 100%;
+            max-height: 100%;
+            background: url('qrcode.png') no-repeat center center;
+            background-size: contain; /* 保持图片比例，完整显示在视频区域内 */
+        }
+        .footer {
+            background-color: #f5f5f5;
+            padding: 20px;
+            text-align: center;
+            font-size: 15px;
+            color: #666;
+        }
     </style>
 </head>
+
 <body>
+    <div class="header">
+        <h2>WebSocket+Fmp4流播放器</h2>
+        <small>支持H264/H265/AAC</small>
+    </div>
+    <div class="control-bar">
+        <input type="text" id="urlInput" value="ws://192.168.0.29:8888/live/test.live.mp4" placeholder="输入流地址">
+        <button class="play-btn" id="playBtn">播放</button>
+        <button class="stop-btn" id="stopBtn">停止</button>
+        <img id="qrcode" src="qrcode.png" alt="二维码" style="z-index:99;width:40px;height:40px;cursor:pointer;border:1px solid #ccc;"
+                    onclick="toggleQRCode()" title="点击放大显示二维码">
+        <!-- 二维码大图弹层 -->
+        <div id="qrcodeModal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.8);z-index:999;justify-content:center;align-items:center;">
+            <div style="background:white;padding:20px;border-radius:10px;text-align:center;">
+                <img src="qrcode.png" alt="扫描二维码" style="width:200px;height:200px;">
+                <p style="margin:10px 0 0 0;color:#333;">扫码关注[音视频开发训练营]</p>
+                <button onclick="toggleQRCode()" style="margin-top:10px;padding:5px 15px;color:#333">关闭</button>
+            </div>
+        </div>
+    </div>
+    <!-- 视频区域 controls ， muted  -->
+    <div class="video-container">
+        <video id="videoPlayer" playsinline  webkit-playsinline >您的浏览器不支持video标签</video>
+    </div>
+    <div class="footer"> WebSocket+Fmp4流播放器 &copy; 2025 
+        <a href="https://github.com/machh/machhPlayer" target="_blank" 
+            style="color: #b60cb6; text-decoration: none; transition: color 0.3s;"
+            onmouseover="this.style.color='#80c1ff'" 
+            onmouseout="this.style.color='#b60cb1'"> machhPlayer 
+        </a> 
+        | 基于 MSE API
+    </div>
 
-<video id="video" autoplay playsinline ></video>
+    <script src="mp4box.all.min.js"></script>
+    <script src="maPlayer.js"></script>
+    <script>
+        const urlInput = document.getElementById('urlInput');
+        const playBtn = document.getElementById('playBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const player = new maPlayer('#videoPlayer', {
+                targetLatency: 0.4,
+                maxLatency: 0.8,
+                catchUpRate: 1.15,
+                codec: 'h264' 
+            });
+        playBtn.addEventListener('click', () => {
+            const url = urlInput.value.trim();
+            if (url) {
+                player.play(url);
+                //video.play().catch(err => console.error('播放失败:', err));
+            } else {
+                alert('请输入有效的流地址');
+            }
+        });
 
-<div class="control">
-    <input id="url" type="text" placeholder="ws://your-server/live/stream" 
-           value="ws://192.168.0.29:8888/live/test">
-    <button onclick="player.play(url.value)">播放</button>
-    <button onclick="player.stop()">停止</button>
-</div>
+        stopBtn.addEventListener('click', () => {
+            player.stop()
+            // 实际项目中这里需要关闭WebSocket连接
+            //alert('已停止播放');
+        });
 
-<script src="maPlayer.js"></script>
-<script>
-    const player = new MAPlayer('#video', {
-        targetLatency: 0.4,
-        maxLatency: 0.8,
-        catchUpRate: 1.15,
-        codec: 'h264' 
-    });
-
-    // 可选：回车播放 muted
-    document.getElementById('url').addEventListener('keypress', e => {
-        if (e.key === 'Enter') player.play(e.target.value);
-    });
+        
+    function toggleQRCode() {
+        const modal = document.getElementById('qrcodeModal');
+        modal.style.display = modal.style.display === 'flex' ? 'none' : 'flex';
+    }
 </script>
-
 </body>
 </html>

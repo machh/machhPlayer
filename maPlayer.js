@@ -1,385 +1,381 @@
-// maPlayer.js (2025 终极修复版 - 遵循 MSE 最佳实践)
-class MAPlayer {
-    constructor(videoElement, options = {}) {
+// maPlayer.js —— 2025 终极生产版（H264/H265 通用 
+class maPlayer {
+   constructor(videoElement, options = {}) {
         this.video = typeof videoElement === 'string' ? document.querySelector(videoElement) : videoElement;
-        if (!this.video) throw new Error('Video element not found');
+        if (!this.video) {
+            throw new Error('Video element not found');
+        }
 
         this.config = {
-            targetLatency: 0.5,
-            maxLatency: 1.0,
-            seekThreshold: 2.0,
-            catchUpRate: 1.1,
-            maxQueueSegments: 50,
-            maxRestarts: 10,       // 最大重连次数
-            retryDelay: 1000,      // 初始重连延迟 (ms)
-            cleanupIntervalMs: 5000, // 每 5 秒清理一次已播放的 buffer
-            codec: 'h264',         // 默认为 h264
+            maxQueueSegments: 80,
+            catchUpRate: 1.15,
+            normalRate: 1.0,
+            fallbackCodec: 'video/mp4; codecs="avc1.640028,mp4a.40.2"', // 最常见的 H264+AAC
+            mp4boxTimeout: 12000,   // H265 init segment 较大，设置较长超时
+            preferH265: true,       // H265 优先
             ...options
         };
 
         this.state = {
             ws: null,
-            mediaSource: null,
-            sourceBuffer: null,
-            objectUrl: null,
+            ms: null,
+            sb: null,
             queue: [],
-            isPlaying: false,
-            cleanupTimer: null,
-            watchdogTimer: null,
+            playing: false,
+            codecReceived: false,
+            hasInitSegment: false,
+            pendingInitChunk: null,     // 缓存 init segment
             lastAppendTime: 0,
-            stuckRestartCount: 0,
-            hasInitSegment: false,   // 【关键】是否已追加 moov
-            currentRetryDelay: this.config.retryDelay, // 当前重连延迟
-            isAppending: false       // SourceBuffer 正在更新的内部标记
+            watchdogTimer: null,
+            cleanupTimer: null,
+            reconnectTimer: null,
+            mp4boxTimer: null           // MP4Box 解析超时定时器
         };
 
-        this.mimeCodec = null;
         this.currentUrl = null;
-        
-        this.video.addEventListener('error', (e) => {
-            const err = this.video.error;
-            console.error('[MAPlayer] Video Element Error:', err ? `${err.code}: ${err.message}` : 'Unknown');
-            this.stop(true); // 发生致命错误，强制清理并重试
-        });
     }
 
-    _getSupportedCodec() {
-        // 【已修复】H.264 包含 AAC 标识 mp4a.40.2
-        const codecs = {
-            'h265': [
-                'video/mp4; codecs="hev1.1.6.L120.B0"', 'video/mp4; codecs="hvc1.1.6.L120.B0"', 
-                'video/mp4; codecs="hev1"', 'video/mp4; codecs="hvc1"'
-            ],
-            'h264': [
-                'video/mp4; codecs="avc1.4d401e, mp4a.40.2"', // Main Profile + AAC (推荐)
-                'video/mp4; codecs="avc1.42e01e, mp4a.40.2"', // Baseline Profile + AAC
-                'video/mp4; codecs="avc1.64001e, mp4a.40.2"', // High Profile + AAC
-                'video/mp4; codecs="avc1, mp4a.40.2"'         // 泛型 + AAC
-            ]
-        };
-
-        const type = this.config.codec || 'h264';
-        const candidates = codecs[type];
-
-        if (!candidates) throw new Error(`Unknown codec type: ${type}`);
-
+    // 获取降级 codec 字符串
+    _getFallbackCodecString() {
+        const candidates = this.config.preferH265 ? [
+            'hev1.1.6.L93.90', 'hev1.1.6.L120.B0', 'hev1.1.6.L123.90', 'hev1.1.2.L123.80',
+            'hvc1.1.6.L93.90', 'hvc1.1.6.L120.B0', 'hvc1.1.2.L123.80',
+            'hev1', 'hvc1',
+            'avc1.64002A', 'avc1.640028', 'avc1.64001E', 'avc1.42E01E'
+        ] : [
+            'avc1.640028', 'avc1.42E01E', 'avc1.64001E',
+            'hev1', 'hvc1'
+        ];
         for (const c of candidates) {
-            if (MediaSource.isTypeSupported(c)) {
-                console.log(`[MAPlayer] 选中 Codec (${type}): ${c}`);
+            if (MediaSource.isTypeSupported(`video/mp4; codecs="${c}"`)) {
                 return c;
             }
         }
-        throw new Error(`当前浏览器不支持 ${type}`);
+        return 'avc1.64001e'; //640028
     }
 
-    async _createMediaSource() {
-        return new Promise((resolve, reject) => {
-            // 【已修复】清理旧的 Object URL
-            if (this.state.objectUrl) URL.revokeObjectURL(this.state.objectUrl);
-            
-            const ms = new MediaSource();
-            const url = URL.createObjectURL(ms);
-            this.state.mediaSource = ms;
-            this.state.objectUrl = url;
-            this.video.src = url;
-
-            const onSourceOpen = () => {
-                console.log('[MAPlayer] MediaSource opened. ReadyState:', ms.readyState);
-                ms.removeEventListener('sourceopen', onSourceOpen);
-                resolve(ms);
-            };
-
-            ms.addEventListener('sourceopen', onSourceOpen);
-            ms.addEventListener('sourceclose', () => console.warn('[MAPlayer] MediaSource closed!'));
-            ms.addEventListener('sourceended', () => console.log('[MAPlayer] MediaSource ended'));
-            
-            this.video.load(); // 强制加载新 URL
-        });
-    }
-
-    _startCleanupInterval() {
-        if (this.state.cleanupTimer) clearInterval(this.state.cleanupTimer);
-        
-        // 【已修复】定期删除已播放 buffer，释放内存 (SourceBuffer.remove)
-        this.state.cleanupTimer = setInterval(() => {
-            const sb = this.state.sourceBuffer;
-            if (!sb || sb.updating || !this.state.isPlaying || sb.buffered.length === 0) return;
-
-            const current = this.video.currentTime;
-            const start = sb.buffered.start(0);
-
-            // 保留当前播放时间前 1 秒的 buffer
-            const removeTime = current - 1.0; 
-            
-            if (removeTime > start) {
-                try {
-                    console.log(`[Cleanup] 删除旧 buffer: [${start.toFixed(2)}s] -> [${removeTime.toFixed(2)}s]`);
-                    sb.remove(start, removeTime);
-                } catch (err) {
-                    console.warn('[Cleanup] 删除 buffer 失败:', err);
-                }
-            }
-        }, this.config.cleanupIntervalMs);
-    }
-    
-    // 【新增】统一追加逻辑，处理重试
-    _appendBuffer(chunk) {
-        if (!this.state.sourceBuffer || this.state.sourceBuffer.updating) return false;
-        
-        try {
-            this.state.isAppending = true;
-            this.state.sourceBuffer.appendBuffer(chunk);
-            this.state.lastAppendTime = Date.now();
-            return true;
-        } catch (err) {
-            this.state.isAppending = false;
-            if (err.name === 'QuotaExceededError') {
-                console.error('[MAPlayer] appendBuffer 失败: QuotaExceededError。等待清理。');
-                // 发生配额错误时，不放回队列，而是等待 cleanup 释放内存。
-            } else {
-                console.error('[MAPlayer] appendBuffer 异常:', err);
-                // 严重错误，清空队列并尝试重连
-                this.stop(true);
-            }
+    // 检查 SourceBuffer 是否有效
+    _isSourceBufferValid() {
+        // 确保所有必要的属性都存在
+        if (!this.state.sb || !this.state.ms || !this.state.ms.sourceBuffers) {
             return false;
         }
+        
+        // 检查 MediaSource 状态
+        if (this.state.ms.readyState !== 'open') {
+            return false;
+        }
+        
+        // sourceBuffers 是 SourceBufferList，不是数组，使用 for 循环检查
+        try {
+            for (let i = 0; i < this.state.ms.sourceBuffers.length; i++) {
+                if (this.state.ms.sourceBuffers[i] === this.state.sb) {
+                    return true;
+                }
+            }
+        } catch (e) {
+            console.warn('[maPlayer] 检查 SourceBuffer 有效性失败:', e);
+            return false;
+        }
+        
+        return false;
     }
 
-    _processQueue() {
-        if (this.state.queue.length === 0 || !this.state.sourceBuffer) return;
-        
-        if (this.state.sourceBuffer.updating) {
-            // 如果 SourceBuffer 忙，等待 updateend 事件来触发下一次处理
+    // 1. 队列消费（updateend 驱动）
+    _drainQueue() {
+        if (!this._isSourceBufferValid() || this.state.sb.updating || this.state.queue.length === 0) return;
+        try {
+            this.state.sb.appendBuffer(this.state.queue.shift());
+            this.state.lastAppendTime = Date.now();
+        } catch (e) {
+            console.warn('[maPlayer] appendBuffer 失败', e);
+        }
+    }
+
+    // 使用 MP4Box 解析 init segment 获取 codec
+    _parseInitWithMP4Box(chunk) {
+        if (typeof MP4Box === 'undefined') {
+            console.warn('mp4box.js 未加载，使用降级 codec');
+            this._createSourceBuffer(this._getFallbackCodecString());
+            if (this.state.pendingInitChunk) {
+                this.state.queue.unshift(this.state.pendingInitChunk);
+                this.state.pendingInitChunk = null;
+            }
             return;
         }
-        
-        // 1. 【关键修复】处理 Init Segment (moov)
-        if (!this.state.hasInitSegment) {
-            // 我们信任服务端总是将 moov 作为第一个包发送
-            const initSegment = this.state.queue.shift();
-            if (initSegment && this._appendBuffer(initSegment)) {
-                console.log('[MAPlayer] 成功追加 Init Segment (MOOV)');
-                this.state.hasInitSegment = true;
-                return;
-            } else {
-                console.error('[MAPlayer] 警告：Init Segment 追加失败或缺失，清空队列。');
-                this.state.queue = [];
-                return;
+
+        const mp4boxfile = MP4Box.createFile();
+        mp4boxfile.onError = e => {
+            console.error('MP4Box error:', e);
+            clearTimeout(this.state.mp4boxTimer);
+            // MP4Box 解析失败，降级使用默认 codec
+            this._createSourceBuffer(this._getFallbackCodecString());
+            if (this.state.pendingInitChunk) {
+                this.state.queue.unshift(this.state.pendingInitChunk);
+                this.state.pendingInitChunk = null;
             }
-        }
-        
-        // 2. 处理 Media Fragments (moof+mdat)
-        const fragment = this.state.queue.shift();
-        if (fragment) {
-            this._appendBuffer(fragment);
-        }
-    }
+        };
 
-    _startWatchdog() {
-        if (this.state.watchdogTimer) clearInterval(this.state.watchdogTimer);
+        mp4boxfile.onReady = (info) => {
+            if (this.state.codecReceived) return;
+            clearTimeout(this.state.mp4boxTimer);
 
-        // 延迟监控和追帧逻辑
-        this.state.watchdogTimer = setInterval(() => {
-            if (!this.state.isPlaying || !this.state.sourceBuffer || this.state.sourceBuffer.buffered.length === 0) return;
-
-            const buffered = this.state.sourceBuffer.buffered;
-            const end = buffered.end(buffered.length - 1);
-            const current = this.video.currentTime;
+            const videoTrack = info.videoTracks?.[0];
+            const audioTrack = info.audioTracks?.[0];
+            // 构建完整的 codec 字符串，包含视频和音频
+            let codecParts = [];
+            if (videoTrack) {
+                codecParts.push(videoTrack.codec);
+            }
+            if (audioTrack) {
+                codecParts.push(audioTrack.codec);
+            }
             
-            // 追帧/延迟控制
-            const lag = end - current;
-            if (lag > this.config.seekThreshold) {
-                console.warn(`[Latency] 延迟过高 ${lag.toFixed(2)}s -> Seek to ${end - 0.5}`);
-                this.video.currentTime = end - 0.5; // 跳转到最新片段的前面一点
-            }
+            // 如果没有解析到 codec，使用降级策略
+            let codec = [];
+            if (codecParts.length > 0) {
+                codec = codecParts.join(', ') ;
+                console.log('[maPlayer] MP4Box解析codec成功:', codec);
+            } else {
+                codec = this._getFallbackCodecString();
+                console.log('[maPlayer] MP4Box解析codec失败,_getFallbackCodecString:', codec);
+            } 
 
-            // 卡顿检测：5秒内 SourceBuffer 状态未改变，且队列里有大量数据
-            const now = Date.now();
-            if (this.state.queue.length > 5 && (now - this.state.lastAppendTime > 5000)) {
-                console.warn('[MAPlayer] SourceBuffer 卡死 (5s 无写入), 重启...');
-                this.stop(true); // 触发重连
-            }
-        }, 500);
-    }
-    
-    // 【新增】WebSocket 错误/关闭时的重连逻辑
-    _handleWsClose(wasClean) {
-        if (!this.state.isPlaying) return;
-
-        console.warn(`[MAPlayer] WebSocket ${wasClean ? '已正常关闭' : '非正常断开'}, 尝试重连...`);
-
-        if (this.state.stuckRestartCount >= this.config.maxRestarts) {
-            console.error('[MAPlayer] 达到最大重连次数，停止播放。');
-            this.stop(false); // 停止，不重试
-            return;
-        }
-
-        this.state.stuckRestartCount++;
-        
-        // 【已修复】指数退避 (Exponential Backoff)
-        const delay = Math.min(this.state.currentRetryDelay, 10000); // 最大延迟 10秒
-        this.state.currentRetryDelay = delay * 1.5;
-
-        this.stop(false); // 先清理状态，但不清理 URL 和重试计数
-
-        setTimeout(() => {
-            console.log(`[MAPlayer] 第 ${this.state.stuckRestartCount} 次重连 (延迟 ${delay / 1000}s)...`);
-            this.play(this.currentUrl, true); // 传入 isRetry 标志
-        }, delay);
-    }
-
-    async play(wsUrl, isRetry = false) {
-        if (this.state.isPlaying) return;
-        this.currentUrl = wsUrl;
-        this.state.isPlaying = true;
-
-        if (!isRetry) {
-            // 首次播放或用户主动点击，重置重连计数
-            this.state.stuckRestartCount = 0;
-            this.state.currentRetryDelay = this.config.retryDelay;
-        }
+            this._createSourceBuffer(codec);
+        };
 
         try {
-            this.mimeCodec = this._getSupportedCodec();
-
-            await this._createMediaSource();
-
-            const sb = this.state.mediaSource.addSourceBuffer(this.mimeCodec);
-            sb.mode = 'sequence'; // 必须是 sequence
-            this.state.sourceBuffer = sb;
-            this.state.hasInitSegment = false; // 重置 Init 状态
-
-            // 【关键修复】updateend 驱动队列消费
-            sb.addEventListener('updateend', () => {
-                this.state.isAppending = false;
-                
-                // 【已修复】首次追帧逻辑：在 Init Segment 加载完成后尝试跳转
-                if (this.state.hasInitSegment && sb.buffered.length > 0 && this.video.currentTime < sb.buffered.start(0) + 0.1) {
-                    const seekTime = sb.buffered.start(0);
-                    console.log(`[MAPlayer] [Ready] Init Segment Loaded, 首次跳转至: ${seekTime.toFixed(2)}s`);
-                    this.video.currentTime = seekTime;
-
-
-                    if (this.video.paused) { 
-                        this.video.play().catch(e => {
-                            // 忽略常见的 AbortError，因为这是浏览器策略问题，代码无法解决
-                            if (e.name !== 'AbortError') {
-                                console.warn("[MAPlayer] 自动播放失败:", e);
-                            }
-                        });
-                    }
-                }
-                
-                this._processQueue(); // 写入完成后，立即处理下一个包
-            });
-
-            sb.addEventListener('error', (e) => console.error('[MAPlayer] SourceBuffer Error:', e));
-
-            this._startWatchdog();
-            this._startCleanupInterval(); // 启动内存清理
-
-            const ws = new WebSocket(wsUrl);
-            ws.binaryType = 'arraybuffer';
-            this.state.ws = ws;
-
-            ws.onopen = () => console.log('[MAPlayer] WS Connected');
-            
-            // 【已修复】使用单独的关闭/错误处理函数
-            ws.onclose = (e) => this._handleWsClose(e.code === 1000);
-            ws.onerror = (e) => {
-                console.error('[MAPlayer] WS Error', e);
-                this._handleWsClose(false);
-            };
-
-            ws.onmessage = (e) => {
-                if (!this.state.isPlaying) return;
-                const chunk = new Uint8Array(e.data);
-                
-                // 队列长度控制 (丢弃最旧的)
-                if (this.state.queue.length > this.config.maxQueueSegments) {
-                    console.warn(`[MAPlayer] 队列溢出: 丢弃最旧的 ${this.state.queue.shift().byteLength} 字节`);
-                }
-                
-                this.state.queue.push(chunk);
-                
-                // 如果 SourceBuffer 空闲，立即尝试写入
-                if (!sb.updating && !this.state.isAppending) {
-                    this._processQueue();
-                }
-            };
-        } catch (err) {
-            console.error('[MAPlayer] Setup Failed:', err);
-            this.stop(true); // 设置失败，尝试重连
+            // MP4Box 需要 fileStart 属性来正确解析
+            const arrayBuffer = chunk;
+            arrayBuffer.fileStart = 0;
+            mp4boxfile.appendBuffer(arrayBuffer);
+            mp4boxfile.flush();
+        } catch (e) {
+            console.error('MP4Box appendBuffer 失败:', e);
+            clearTimeout(this.state.mp4boxTimer);
+            // 异常情况下降级使用默认 codec
+            this._createSourceBuffer(this._getFallbackCodecString());
+            if (this.state.pendingInitChunk) {
+                this.state.queue.unshift(this.state.pendingInitChunk);
+                this.state.pendingInitChunk = null;
+            }
         }
     }
 
-    // shouldRetry: 是否应该触发重连逻辑
-    stop(shouldRetry = false) {
-        // ... (省略部分代码，使用上述代码中的 stop 实现)
-        // 关键清理步骤：
-
-        this.state.isPlaying = false;
+    // 2. 创建 SourceBuffer（动态或降级）
+    _createSourceBuffer(codecString) {
+        if (this.state.sb || this.state.codecReceived) return;
+        const mime = `video/mp4; codecs="${codecString}"`;
+        console.log('[maPlayer] 尝试创建 SourceBuffer, mime => ', mime);
         
-        // 1. 关闭 WebSocket (不触发 onclose 重连)
+        // 验证 MIME 类型是否被支持
+        if (!MediaSource.isTypeSupported(mime)) {
+            console.warn(`[maPlayer] 不支持 ${mime}，尝试降级 codec`);
+            // 使用不同的 codec 字符串，避免无限递归
+            const fallbackCodec = this._getFallbackCodecString();
+            if (fallbackCodec !== codecString) {
+                this._createSourceBuffer(fallbackCodec);
+            } else {
+                console.error('[maPlayer] 所有 codec 都不被支持');
+            }
+            return;
+        }
+        
+        try {
+            this.state.sb = this.state.ms.addSourceBuffer(mime);
+            this.state.sb.mode = 'segments'; // 关键！比 sequence稳
+            this.state.sb.addEventListener('updateend', () => this._drainQueue());
+            this.state.sb.addEventListener('error', (e) => console.error('SourceBuffer error', e));
+            console.log('[maPlayer] SourceBuffer 创建成功:', codecString);
+            this.state.codecReceived = true;
+            
+            // sb 创建成功后，立即消费 pending init chunk
+            if (this.state.pendingInitChunk) {
+                this.state.queue.unshift(this.state.pendingInitChunk); // 优先放队首
+                this.state.pendingInitChunk = null;
+                // 直接 append，不通过 _drainQueue()，避免 SourceBuffer 有效性检查问题
+                try {
+                    this.state.sb.appendBuffer(this.state.queue.shift());
+                } catch (appendError) {
+                    console.warn('[maPlayer] 直接 append init chunk 失败:', appendError);
+                }
+            }
+        } catch (e) {
+            console.error('[maPlayer] 创建 SourceBuffer 失败，尝试降级', e);
+            // 使用不同的 codec 字符串，避免无限递归
+            const fallbackCodec = this._getFallbackCodecString();
+            if (fallbackCodec !== codecString) {
+                this._createSourceBuffer(fallbackCodec);
+            } else {
+                console.error('[maPlayer] 所有 codec 都创建失败');
+            }
+        }
+    }
+
+    // 3. 启动各种守护进程
+    _startGuards() {
+        // 低延迟追帧 + 后台防卡死
+        this.state.watchdogTimer = setInterval(() => {
+            if (!this.state.playing || this.video.paused || !this.state.sb?.buffered?.length) return;
+
+            const end = this.state.sb.buffered.end(this.state.sb.buffered.length - 1);
+            const lag = end - this.video.currentTime;
+
+            // 后台切走时强制跳最新帧
+            if (document.hidden) {
+                this.video.currentTime = end - 0.3;
+                return;
+            }
+
+            // 前台延迟控制
+            if (lag > 2.0) {
+                this.video.currentTime = end - 0.3; // 跳帧
+            } else if (lag > 0.9) {
+                this.video.playbackRate = this.config.catchUpRate;
+            } else {
+                this.video.playbackRate = this.config.normalRate;
+            }
+        }, 500);
+
+        // 定期清理旧缓存
+        this.state.cleanupTimer = setInterval(() => {
+            if (!this.state.sb || this.state.sb.updating || !this.state.sb.buffered.length) return;
+            try {
+                const removeBefore = this.video.currentTime - 3;
+                if (removeBefore > 0) {
+                    for (let i = 0; i < this.state.sb.buffered.length; i++) {
+                        if (this.state.sb.buffered.end(i) < removeBefore) {
+                            this.state.sb.remove(this.state.sb.buffered.start(i), this.state.sb.buffered.end(i));
+                        }
+                    }
+                }
+            } catch (e) {}
+        }, 5000);
+    }
+
+    async play(wsUrl) {
+        if (this.state.playing) return;
+        this.currentUrl = wsUrl;
+        this.state.playing = true;
+        this.state.codecReceived = false;
+        this.state.hasInitSegment = false;
+        this.state.pendingInitChunk = null;
+        this.state.queue = [];
+
+        // MediaSource
+        const ms = new MediaSource();
+        this.state.ms = ms;
+        this.video.src = URL.createObjectURL(ms);
+
+        await new Promise(r => ms.addEventListener('sourceopen', r, { once: true }));
+
+        // 超长 init 保护（H265 常见 5~10MB）
+        this.state.mp4boxTimer = setTimeout(() => {
+            if (!this.state.codecReceived) {
+                console.warn('[maPlayer] init 解析超时，强制使用H265优先codec');
+                this._createSourceBuffer(this._getFallbackCodecString());
+                if (this.state.pendingInitChunk) {
+                    this.state.queue.unshift(this.state.pendingInitChunk);
+                    this.state.pendingInitChunk = null;
+                }
+            }
+        }, this.config.mp4boxTimeout);
+
+        // WebSocket
+        const ws = new WebSocket(wsUrl);
+        ws.binaryType = 'arraybuffer';
+        this.state.ws = ws;
+
+        ws.onmessage = (e) => {
+            if (!this.state.playing) return;
+            const data = new Uint8Array(e.data);
+
+            // 第一种：带 0x09 协议头的国产流
+            if (!this.state.codecReceived && data[0] === 9) {
+                clearTimeout(this.state.mp4boxTimer);
+                const codecStr = new TextDecoder().decode(data.slice(1));
+                console.log('[maPlayer] 收到 0x09 codec 包:', codecStr);
+                this._createSourceBuffer(codecStr);
+                this.state.codecReceived = true;
+                return;
+            }
+
+            // 第二种：标准 fMP4（第一包就是 init segment）
+            if (!this.state.codecReceived) {
+                clearTimeout(this.state.mp4boxTimer);
+                console.log('[maPlayer] 收到标准init segment, 使用MP4Box解析codec');
+                
+                // 缓存 init segment
+                this.state.pendingInitChunk = e.data;
+                // 使用 MP4Box 解析获取 codec
+                this._parseInitWithMP4Box(e.data);
+                return;
+            }
+
+            // 正常媒体数据
+            this.state.queue.push(e.data);
+
+            // 队列过长自动丢帧（保低延迟）
+            if (this.state.queue.length > this.config.maxQueueSegments) {
+                this.state.queue.splice(0, this.state.queue.length - this.config.maxQueueSegments + 20);
+            }
+
+            this._drainQueue();
+        };
+
+        ws.onclose = ws.onerror = () => {
+            console.log('[maPlayer] WebSocket连接断开, 3秒后自动重连...');
+            clearTimeout(this.state.mp4boxTimer);
+            if (this.state.playing) {
+                clearTimeout(this.state.reconnectTimer);
+                this.state.reconnectTimer = setTimeout(() => this.play(wsUrl), 3000);
+            }
+        };
+
+        // pause 自动恢复（防自动暂停黑屏）
+        this.video.addEventListener('pause', () => {
+            if (this.state.sb?.buffered?.length) {
+                const end = this.state.sb.buffered.end(this.state.sb.buffered.length - 1);
+                if (this.video.currentTime >= end - 0.5) {
+                    this.video.currentTime = end - 0.1;
+                    this.video.play().catch(() => {});
+                }
+            }
+        });
+
+        this._startGuards();
+        this.video.play().catch(() => {});
+    }
+
+    stop() {
+        this.state.playing = false;
+        console.log('[maPlayer] stop 销毁释放资源...');
+        
+        // 清理所有定时器
+        clearTimeout(this.state.reconnectTimer);
+        clearTimeout(this.state.mp4boxTimer);
+        [this.state.watchdogTimer, this.state.cleanupTimer].forEach(clearInterval.bind(window));
+
         if (this.state.ws) {
             this.state.ws.onclose = this.state.ws.onerror = null;
-            try { this.state.ws.close(); } catch (e) {}
+            this.state.ws.close();
             this.state.ws = null;
         }
 
-        // 2. 清除定时器
-        [this.state.watchdogTimer, this.state.cleanupTimer].forEach(id => {
-            if (id) clearInterval(id);
-        });
-
-        // 3. 清理队列
-        this.state.queue = [];
-        
-        // 4. 清理 SourceBuffer / MediaSource
-        try {
-            if (this.state.sourceBuffer && this.state.mediaSource?.readyState === 'open') {
-                this.state.mediaSource.removeSourceBuffer(this.state.sourceBuffer);
-            }
-        } catch(e) {}
-        this.state.sourceBuffer = null;
-
-        try {
-            if (this.state.mediaSource?.readyState === 'open') {
-                this.state.mediaSource.endOfStream();
-            }
-        } catch(e) {}
-        this.state.mediaSource = null;
-        
-        // 5. 【已修复】清理 video 标签
-        try {
-            if (this.state.objectUrl) {
-                URL.revokeObjectURL(this.state.objectUrl);
-                this.state.objectUrl = null;
-            }
-            this.video.removeAttribute('src');
-            this.video.load();
-        } catch (e) {}
-        
-        // 6. 处理重连逻辑
-        if (shouldRetry) {
-            this.state.stuckRestartCount++;
-            const delay = Math.min(this.state.currentRetryDelay, 10000);
-            this.state.currentRetryDelay = delay * 1.5;
-            
-            if (this.state.stuckRestartCount < this.config.maxRestarts) {
-                 setTimeout(() => {
-                    console.log(`[MAPlayer] 内部错误触发重连 (延迟 ${delay / 1000}s)...`);
-                    this.play(this.currentUrl, true);
-                }, delay);
-            } else {
-                 console.error('[MAPlayer] 达到最大内部重连次数，彻底停止。');
-            }
-        } else {
-            // 正常停止，重置重连计数
-            this.state.stuckRestartCount = 0;
-            this.state.currentRetryDelay = this.config.retryDelay;
+        if (this.state.ms?.readyState === 'open') {
+            try { this.state.ms.endOfStream(); } catch (e) {}
         }
+
+        this.video.removeAttribute('src');
+        this.video.load();
+
+        this.state = {
+            queue: [], playing: false, codecReceived: false, hasInitSegment: false,
+            pendingInitChunk: null,
+            lastAppendTime: 0, ws: null, ms: null, sb: null,
+            mp4boxTimer: null
+        };
     }
 }
 
-window.MAPlayer = MAPlayer;
+window.maPlayer = maPlayer;
