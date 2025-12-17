@@ -1,6 +1,6 @@
 # maPlayer
 
-maPlayer是基于MSE，FMP4协议的web播放器,目的是在浏览器上实现低延迟（0-3 秒）视频播放,支持H.264和H.265码流，通过HTML5 <video> 标签和 Media Source Extensions实现原生播放。
+maPlayer是基于MSE，FMP4协议的web播放器,目的是在浏览器上实现低延迟（0-3 秒）视频播放,支持H.264和H.265码流，通过HTML5 video标签和Media Source Extensions实现原生播放。
 
 
 ....
