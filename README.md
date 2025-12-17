@@ -15,3 +15,6 @@ macPlayer 是一个基于WebSocket-fMP4协议的Web视频播放器项目,其主�
 
 ## 项目计划
 这个项目是我用来熟悉web端音视频播放相关技术方案的入门项目。后期如果能力和时间允许，再尝试WASM，WebGL, WebGPU , WebCodecs,WebTransport等更加牛逼的技术方案.
+
+
+![延时对比](./hik.png "延时对比")
