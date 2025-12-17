@@ -1,14 +1,13 @@
 # maPlayer
 
-macPlayer是一个基于WebSocket-fMP4协议的Web视频播放器,其主要目的是在浏览器上实现低延迟（0-3 秒）视频播放，支持H.264和H.265码流，使用mp4box.js解析mp4元数据，
-通过HTML5 <video> 标签和 Media Source Extensions (MSE) 实现原生播放。
+maPlayer是基于MSE，FMP4协议的web播放器,目的是在浏览器上实现低延迟（0-3 秒）视频播放,支持H.264和H.265码流，通过HTML5 <video> 标签和 Media Source Extensions实现原生播放。
 
 
 ....
 
  
 ## 关键特性
-
+- 使用mp4box.js解析mp4元数据，
 - 低延迟播放：延时1s左右， 通过WebSocket接收fMP4片段，直接追加到MSE的 SourceBuffer中，使用 video.buffered设置currentTime实现从缓存片段的播放。
 - 编解码支持：原生H.264/H.265（fMP4 格式）
 - 技术栈：WebSocket（流传输）、MSE（媒体追加）、HTML5 Video（渲染）
