@@ -9,8 +9,9 @@ class maPlayer {
         this.config = {
             targetLatency: 0.3,
             maxLatency: 0.8,
-            seekThreshold: 1.0,
+            seekThreshold: 1.5,        // 提高硬跳阈值，0.8~1.5s 用倍速平滑追赶，>1.5s 才硬跳，减少 seek 卡顿
             aggressiveSeekThreshold: 0.5,
+            minSeekInterval: 1000,     // 两次 seek 的最小间隔(ms)，节流防止 seek 风暴
             catchUpRate: 1.2,
             normalRate: 1.0,
             maxBufferLength: 2,
@@ -29,6 +30,7 @@ class maPlayer {
             retryDelay: 1000,
             maxRetryDelay: 10000,
             autoReconnect: true,
+            exponentialBackoff: true,  // 启用指数退避（原代码引用了该项但 config 未定义，导致退避一直失效）
             reconnectBackoffFactor: 1.3,
             fallbackCodec: 'video/mp4; codecs="avc1.640028,mp4a.40.2"',
             mp4boxTimeout: 5000, 			// 减少超时时间
@@ -89,6 +91,8 @@ class maPlayer {
             totalBytesAppended: 0,
             totalBytesCleaned: 0,
             sourceBufferErrorCount: 0, // 新增：SourceBuffer错误计数
+            objectUrl: null,           // 保存 createObjectURL 结果，stop 时释放，防止内存泄漏
+            lastSeekTime: 0,           // 上次 seek 的时间戳，用于 seek 节流
         };
 
         this.currentUrl = null;
@@ -136,22 +140,39 @@ class maPlayer {
         document.addEventListener('visibilitychange', this._handleVisibilityChange);
     }
 
-    _aggressiveSeekToLive() {
-        if (!this.state.sb || !this.state.sb.buffered || this.state.sb.buffered.length === 0) {
-            return;
+    _getBufferedEnd() {
+        const b = this.state.sb?.buffered;
+        return (b && b.length) ? b.end(b.length - 1) : null;
+    }
+
+    // 统一的 seek-to-live 入口：带节流，避免频繁 seek 造成的卡顿/黑帧
+    _seekToLiveEdge(targetLatency = 0.1, force = false) {
+        const end = this._getBufferedEnd();
+        if (end === null) return false;
+
+        const now = Date.now();
+        if (!force && now - this.state.lastSeekTime < this.config.minSeekInterval) {
+            return false; // 节流期内不重复 seek
         }
-        
+
+        const target = Math.max(end - targetLatency, 0);
+        // 已经足够接近目标位置，无需 seek
+        if (Math.abs(this.video.currentTime - target) < 0.15) return false;
+
         try {
-            const end = this.state.sb.buffered.end(this.state.sb.buffered.length - 1);
-            const targetTime = Math.max(end - 0.1, 0);
-            
-            if (this.video.currentTime < targetTime - 0.2) {
-                console.log(`[maPlayer] 激进跳转: ${targetTime.toFixed(2)}s`);
-                this.video.currentTime = targetTime;
-            }
+            this.state.lastSeekTime = now;
+            console.log(`[maPlayer] seek→live: ${target.toFixed(2)}s`);
+            this.video.currentTime = target;
+            this._resetPlaybackRate();
+            return true;
         } catch (e) {
-            console.warn('[maPlayer] 激进跳转失败:', e);
+            console.warn('[maPlayer] seek 失败:', e);
+            return false;
         }
+    }
+
+    _aggressiveSeekToLive() {
+        this._seekToLiveEdge(0.1, false);
     }
 
     _onVideoError(e) {
@@ -260,25 +281,9 @@ class maPlayer {
         if (!this._isSourceBufferValid() || this.state.sb.updating || this.state.queue.length === 0) {
             return;
         }
-        
-        const effectiveBuffer = this._getEffectiveBufferLength();
-        if (effectiveBuffer > this.config.maxBufferLength) {
-            console.log(`[maPlayer] 缓冲区过大(${effectiveBuffer.toFixed(2)}s)，先清理`);
-            this._performBufferCleanup(true);
-            setTimeout(() => this._drainQueue(), 100);
-            return;
-        }
-        
-        if (this.config.enableFrameDrop && this._shouldDropFrame()) {
-            this.state.queue.shift();
-            this.state.droppedFramesCount++;
-            
-            if (this.state.droppedFramesCount > 5) {
-                this._aggressiveSeekToLive();
-                this.state.droppedFramesCount = 0;
-            }
-        }
-        
+
+        // 注意：不在此处丢弃待追加分片。fMP4 分片间存在帧间预测，丢中段会破坏解码参考链
+        // （花屏 / parsing failed）。延迟由 _applyLatencyControl 的 seek+倍速控制，内存由 _manageBuffer 清理。
         try {
             const chunk = this.state.queue.shift();
             const chunkSize = chunk.byteLength || 0;
@@ -294,34 +299,10 @@ class maPlayer {
             console.warn('[maPlayer] appendBuffer失败', e);
             if (e.name === 'QuotaExceededError') {
                 console.warn('[maPlayer] 缓冲区配额超限');
-                this._performBufferCleanup(true);
+                this._manageBuffer(true);
                 setTimeout(() => this._drainQueue(), 100);
             }
         }
-    }
-
-    _shouldDropFrame() {
-        if (!this.state.sb || !this.state.sb.buffered || this.state.sb.buffered.length === 0) {
-            return false;
-        }
-        
-        const current = this.video.currentTime;
-        const end = this.state.sb.buffered.end(this.state.sb.buffered.length - 1);
-        const latency = end - current;
-        
-        if (latency > this.config.maxLatency + 0.5) {
-            return true;
-        }
-        
-        if (this.state.queue.length > this.config.dropQueueThreshold) {
-            return true;
-        }
-        
-        if (this.state.memoryWarnings > 2) {
-            return true;
-        }
-        
-        return false;
     }
 
     // === 关键修复：改进的MP4Box解析 ===
@@ -566,8 +547,7 @@ class maPlayer {
         }, this.config.latencyCheckInterval);
 
         this.state.cleanupTimer = setInterval(() => {
-            this._performBufferCleanup(false);
-            this._checkAndForceBufferCleanup();
+            this._manageBuffer(false);
         }, this.config.cleanupCheckInterval);
 
         if (this.config.enableMemoryMonitor) {
@@ -584,31 +564,24 @@ class maPlayer {
     }
     
     _applyLatencyControl(latency, current, end) {
-        if (this.config.enableAggressiveSeek && latency > this.config.aggressiveSeekThreshold) {
-            console.warn(`[maPlayer] 延迟${latency.toFixed(2)}s，激进跳转`);
-            const targetTime = Math.max(end - 0.1, 0);
-            this.video.currentTime = targetTime;
-            this._resetPlaybackRate();
-            return;
-        }
-        
+        // 大延迟：硬跳到 live 边沿（带节流，避免频繁 seek 卡顿）
         if (latency > this.config.seekThreshold) {
-            console.warn(`[maPlayer] 延迟${latency.toFixed(2)}s，跳转`);
-            const targetTime = Math.max(end - this.config.targetLatency, 0);
-            this.video.currentTime = targetTime;
-            this._resetPlaybackRate();
+            console.warn(`[maPlayer] 延迟${latency.toFixed(2)}s，跳转追赶`);
+            this._seekToLiveEdge(this.config.targetLatency, false);
             return;
         }
-        
+
+        // 中等延迟：轻微加速平滑追赶，不 seek
         if (latency > this.config.maxLatency) {
-            this.video.playbackRate = this.config.catchUpRate;
+            if (this.video.playbackRate !== this.config.catchUpRate) {
+                this.video.playbackRate = this.config.catchUpRate;
+            }
             this._schedulePlaybackRateReset();
-        } else if (latency < this.config.targetLatency) {
-            this.video.playbackRate = 0.95;
-            this._schedulePlaybackRateReset();
-        } else {
-            this._resetPlaybackRate();
+            return;
         }
+
+        // 正常区间：恢复 1.0 倍速（不做减速，减速会主动抬高延迟，与低延迟目标相悖）
+        this._resetPlaybackRate();
     }
     
     _stopGuards() {
@@ -643,37 +616,50 @@ class maPlayer {
         }, 1500);
     }
     
-    _performBufferCleanup(force = false) {
-        if (!this.state.sb || this.state.sb.updating || !this.state.playing || 
-            !this.state.sb.buffered || this.state.sb.buffered.length === 0) {
+    // 合并后的统一缓冲区管理：单次最多发起一个 remove，并严格检查 updating，
+    // 杜绝原 _performBufferCleanup + _checkAndForceBufferCleanup 顺序调用导致的并发 remove 抛异常(B2)。
+    _manageBuffer(force = false) {
+        if (!this._isSourceBufferValid() || this.state.sb.updating || !this.state.playing) {
             return;
         }
 
+        const buffered = this.state.sb.buffered;
+        if (!buffered || buffered.length === 0) return;
+
         try {
             const current = this.video.currentTime;
-            const buffered = this.state.sb.buffered;
             const effectiveBuffer = this._getEffectiveBufferLength();
-            
-            if (effectiveBuffer > this.config.maxBufferLength || force) {
-                const removeBefore = current - this.config.backBufferLength;
-                
+
+            // 1) 异常超前缓冲(> 2x maxBufferLength)：裁掉 current+maxBufferLength 之后的数据
+            if (effectiveBuffer > this.config.maxBufferLength * 2) {
+                const targetEnd = current + this.config.maxBufferLength;
                 for (let i = 0; i < buffered.length; i++) {
                     const start = buffered.start(i);
                     const end = buffered.end(i);
-                    
-                    if (end <= removeBefore) {
-                        console.log(`[BufferCleanup] 清理旧区间: [${start.toFixed(2)}s, ${end.toFixed(2)}s]`);
-                        const cleanedBytes = (end - start) * 1024 * 1024;
-                        this.state.totalBytesCleaned += cleanedBytes;
-                        this.state.sb.remove(start, end);
-                        break;
+                    if (end > targetEnd) {
+                        const removeStart = Math.max(start, targetEnd);
+                        if (removeStart < end - 0.01) {
+                            console.log(`[ForceCleanup] 裁剪超前缓冲: [${removeStart.toFixed(2)}, ${end.toFixed(2)}]`);
+                            this.state.sb.remove(removeStart, end);
+                            return; // 一次只做一个 remove，剩余在下个 tick 处理
+                        }
                     }
                 }
-                
-                this.state.lastBufferCleanupTime = Date.now();
+            }
+
+            // 2) 常规清理：移除 current - backBufferLength 之前的回看缓冲
+            if (effectiveBuffer > this.config.maxBufferLength || force) {
+                const removeEnd = current - this.config.backBufferLength;
+                const start = buffered.start(0);
+                if (start < removeEnd - 0.01) {
+                    console.log(`[BufferCleanup] 清理回看缓冲: [${start.toFixed(2)}, ${removeEnd.toFixed(2)}]`);
+                    this.state.totalBytesCleaned += (removeEnd - start) * 1024 * 1024; // 估算值
+                    this.state.sb.remove(start, removeEnd);
+                    this.state.lastBufferCleanupTime = Date.now();
+                }
             }
         } catch (e) {
-            console.warn('[maPlayer] 缓冲区清理失败:', e);
+            console.warn('[maPlayer] 缓冲区管理失败:', e);
         }
     }
     
@@ -699,36 +685,6 @@ class maPlayer {
         return total;
     }
     
-    _checkAndForceBufferCleanup() {
-        if (!this.state.sb || !this.state.sb.buffered || this.state.sb.buffered.length === 0) {
-            return;
-        }
-        
-        const effectiveBuffer = this._getEffectiveBufferLength();
-        
-        if (effectiveBuffer > this.config.maxBufferLength * 2) {
-            console.warn(`[maPlayer] 缓冲区过大 (${effectiveBuffer.toFixed(2)}s)，强制清理`);
-            
-            const current = this.video.currentTime;
-            const targetEnd = current + this.config.maxBufferLength;
-            
-            const buffered = this.state.sb.buffered;
-            for (let i = 0; i < buffered.length; i++) {
-                const start = buffered.start(i);
-                const end = buffered.end(i);
-                
-                if (end > targetEnd) {
-                    const removeStart = Math.max(start, targetEnd);
-                    if (removeStart < end) {
-                        console.log(`[ForceCleanup] 强制清理: [${removeStart.toFixed(2)}s, ${end.toFixed(2)}s]`);
-                        this.state.sb.remove(removeStart, end);
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
     _checkMemoryUsage() {
         if (!this.config.enableMemoryMonitor) return;
         
@@ -756,7 +712,7 @@ class maPlayer {
             
             if (this.state.memoryWarnings > 3) {
                 console.warn('[maPlayer] 内存警告过多，触发强制清理');
-                this._performBufferCleanup(true);
+                this._manageBuffer(true);
                 this.state.queue = [];
                 this.state.memoryWarnings = 0;
             }
@@ -989,6 +945,7 @@ class maPlayer {
                 clearTimeout(this.state.mp4boxTimer);
                 const codecStr = new TextDecoder().decode(data.slice(1));
                 console.log('[maPlayer] 收到 0x09 codec 包:', codecStr);
+                this.state.detectedCodec = /hev|hvc/.test(codecStr) ? 'h265' : 'h264';
                 this._createSourceBuffer(codecStr);
                 this.state.codecReceived = true;
                 return;
@@ -1114,9 +1071,16 @@ class maPlayer {
             this.state.consecutiveStalls = 0;
         }
 
+        // 释放上一次的 ObjectURL，防止重复 play 造成 MediaSource 句柄泄漏
+        if (this.state.objectUrl) {
+            URL.revokeObjectURL(this.state.objectUrl);
+            this.state.objectUrl = null;
+        }
+
         const ms = new MediaSource();
         this.state.ms = ms;
-        this.video.src = URL.createObjectURL(ms); //未保存到 state 中，stop() 方法无法释放。
+        this.state.objectUrl = URL.createObjectURL(ms);
+        this.video.src = this.state.objectUrl;
 
         await new Promise((resolve, reject) => {
             const timeout = setTimeout(() => {
@@ -1164,6 +1128,11 @@ class maPlayer {
             } catch (e) {}
         }
         
+        if (this.state.objectUrl) {
+            URL.revokeObjectURL(this.state.objectUrl);
+            this.state.objectUrl = null;
+        }
+
         this.video.removeAttribute('src');
         this.video.load();
 
@@ -1207,6 +1176,8 @@ class maPlayer {
                 totalBytesAppended: 0,
                 totalBytesCleaned: 0,
                 sourceBufferErrorCount: 0,
+                objectUrl: null,
+                lastSeekTime: 0,
             };
             this.currentUrl = null;
         }
